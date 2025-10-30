@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Browser Plugin Stress Tester</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 16px; color:#111; }
+  h1 { margin: 0 0 8px; font-size: 20px; }
+  .controls { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+  .panel { border:1px solid #ddd; padding:12px; border-radius:8px; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,0.03); }
+  label { display:block; font-size:12px; color:#555; margin-bottom:6px; }
+  input[type=number], select { width:100px; padding:6px; }
+  button { padding:8px 10px; cursor:pointer; border-radius:6px; border:1px solid #bbb; background:#f7f7f7; }
+  #iframeContainer { display:flex; flex-wrap:wrap; gap:6px; max-height:420px; overflow:auto; border:1px dashed #eee; padding:6px; }
+  iframe { width:260px; height:180px; border:1px solid #ccc; }
+  .log { max-height:220px; overflow:auto; font-family: monospace; font-size:12px; background:#0f0f0f; color:#0f0; padding:8px; border-radius:6px; }
+  .stat { display:inline-block; min-width:140px; margin-right:12px; }
+  .status-ok { color: green; }
+  .status-bad { color: red; }
+  .warning { color: darkorange; }
+  .badge { padding:4px 8px; border-radius:6px; background:#eee; margin-left:6px; font-size:12px; }
+</style>
+</head>
+<body>
+<h1>Browser Plugin Stress Tester</h1>
+
+<div class="controls">
+  <div class="panel">
+    <label>Generate iframes (count)</label>
+    <input id="iframeCount" type="number" value="6" min="0"/>
+    <button id="genIframes">Generate Iframes</button>
+    <button id="clearIframes">Clear Iframes</button>
+  </div>
+
+  <div class="panel">
+    <label>Open tabs (count, user-triggered)</label>
+    <input id="tabCount" type="number" value="4" min="0"/>
+    <button id="openTabs">Open Tabs (User gesture)</button>
+  </div>
+
+  <div class="panel">
+    <label>Stress actions</label>
+    <button id="startStress">Start Stress</button>
+    <button id="stopStress">Stop Stress</button>
+    <div style="margin-top:8px;">
+      <label>Workers for CPU</label>
+      <input id="workerCount" type="number" value="4" min="0"/>
+      <label>Fetch requests/sec (per worker)</label>
+      <input id="reqsPerSec" type="number" value="5" min="0" style="width:60px"/>
+    </div>
+  </div>
+
+  <div class="panel">
+    <label>Media load</label>
+    <input id="mediaCount" type="number" value="6" min="0"/>
+    <button id="loadMedia">Load Media</button>
+    <button id="clearMedia">Clear Media</button>
+  </div>
+
+  <div class="panel">
+    <label>Plugin checks</label>
+    <button id="startChecks">Start Checks</button>
+    <button id="stopChecks">Stop Checks</button>
+    <div style="margin-top:8px;">
+      <label>Class that SHOULD be filtered by extension</label>
+      <input id="filterClass" type="text" value="should-be-filtered" />
+    </div>
+  </div>
+</div>
+
+<div style="display:flex; gap:12px; flex-wrap:wrap;">
+  <div class="panel" style="flex:1 1 420px;">
+    <strong>Iframes</strong> <span class="badge" id="iframeCountBadge">0</span>
+    <div id="iframeContainer"></div>
+  </div>
+
+  <div class="panel" style="width:420px;">
+    <strong>Media</strong> <span class="badge" id="mediaCountBadge">0</span>
+    <div id="mediaContainer" style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;"></div>
+  </div>
+
+  <div class="panel" style="width:360px;">
+    <strong>Live stats</strong>
+    <div style="margin-top:8px;">
+      <div class="stat">Event-loop lag: <span id="lagMs">0</span> ms</div>
+      <div class="stat">Device memory: <span id="deviceMemory">unknown</span> GB</div>
+      <div class="stat">JS heap used: <span id="heapUsed">n/a</span></div>
+      <div class="stat">Plugin ping: <span id="pluginPing" class="status-ok">unknown</span></div>
+    </div>
+    <div style="margin-top:8px;">
+      <button id="exportLog">Export Log</button>
+      <button id="clearLog">Clear Log</button>
+    </div>
+  </div>
+</div>
+
+<div class="panel" style="margin-top:12px;">
+  <strong>Sampler page elements (these are what the extension might hide/alter)</strong>
+  <div style="margin-top:8px;">
+    <div id="sampleElements"></div>
+  </div>
+</div>
+
+<div class="panel" style="margin-top:12px;">
+  <strong>Activity log</strong>
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+const logEl = document.getElementById('log');
+const log = (s) => {
+  const t = new Date().toISOString().substr(11,8);
+  logEl.textContent = `[${t}] ${s}\n` + logEl.textContent;
+};
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+const iframeContainer = document.getElementById('iframeContainer');
+const iframeCountBadge = document.getElementById('iframeCountBadge');
+
+document.getElementById('genIframes').addEventListener('click', () => {
+  const n = Number(document.getElementById('iframeCount').value) || 0;
+  for (let i=0;i<n;i++) {
+    const ifr = document.createElement('iframe');
+    ifr.srcdoc = `
+      <html><body>
+        <h4>Child iframe ${i+1}</h4>
+        <div class="child-content">Dynamic content ${Math.random().toString(36).slice(2,8)}</div>
+        <script>
+          setInterval(()=> {
+            const el = document.querySelector('.child-content');
+            if (el) el.textContent = 'Tick ' + Math.random().toString(36).slice(2,6);
+          }, 500 + Math.random()*900);
+        <\/script>
+      </body></html>`;
+    iframeContainer.appendChild(ifr);
+  }
+  iframeCountBadge.textContent = iframeContainer.children.length;
+  log(`Generated ${n} iframes (total: ${iframeContainer.children.length})`);
+});
+document.getElementById('clearIframes').addEventListener('click', () => {
+  iframeContainer.innerHTML = '';
+  iframeCountBadge.textContent = 0;
+  log('Cleared iframes');
+});
+
+document.getElementById('openTabs').addEventListener('click', () => {
+  const n = Number(document.getElementById('tabCount').value) || 0;
+  for (let i=0;i<n;i++) {
+    const w = window.open('', '_blank');
+    if (!w) {
+      log('Popup blocked — open tabs manually or allow popups for this site');
+      break;
+    }
+    w.document.write(`<h3>Stress tab ${i+1}</h3><p>Rapid DOM updates below:</p><div id="c"></div><script>
+      setInterval(()=> {
+        const el = document.getElementById('c');
+        if (el) el.textContent = 'T ' + Math.random().toString(36).slice(2,5);
+      }, 300);
+      for (let j=0;j<3;j++){
+        const img = new Image(); img.src = 'https://picsum.photos/320/180?random=' + Math.random();
+        document.body.appendChild(img);
+      }
+    <\/script>`);
+  }
+  log(`Attempted to open ${n} tabs`);
+});
+
+let stressRunning = false;
+let cpuWorkers = [];
+let churnIntervalIds = [];
+let fetchIntervals = [];
+
+function makeWorkerBlob() {
+  const code = `
+    let running = true;
+    self.onmessage = (e) => {
+      if (e.data === 'stop') running = false;
+      if (e.data === 'start') running = true;
+    };
+    function doWork() {
+      let a = 0;
+      for (let i=0;i<200000;i++) {
+        a += Math.sin(i) * Math.tan(i % 100 + 1);
+      }
+      return a;
+    }
+    async function loop() {
+      while (true) {
+        if (running) {
+          const r = doWork();
+          postMessage({tick: Date.now(), sample: r});
+        }
+        await new Promise(res => setTimeout(res, 10));
+      }
+    }
+    loop();
+  `;
+  return new Blob([code], {type:'application/javascript'});
+}
+
+document.getElementById('startStress').addEventListener('click', async () => {
+  if (stressRunning) return;
+  stressRunning = true;
+  const wCount = Number(document.getElementById('workerCount').value) || 0;
+  const reqsPerSec = Number(document.getElementById('reqsPerSec').value) || 0;
+
+  const blob = makeWorkerBlob();
+  const blobUrl = URL.createObjectURL(blob);
+  for (let i=0;i<wCount;i++) {
+    try {
+      const w = new Worker(blobUrl);
+      w.onmessage = (m) => {
+        if (Math.random() < 0.05) log('Worker alive: ' + JSON.stringify(m.data).slice(0,60));
+      };
+      cpuWorkers.push(w);
+    } catch (err) {
+      log('Worker creation failed: ' + err);
+      break;
+    }
+  }
+  log(`Started ${cpuWorkers.length} CPU workers`);
+
+  const churn = setInterval(() => {
+    for (let i=0;i<20;i++) {
+      const tmp = document.createElement('div');
+      tmp.textContent = 'Churn ' + Math.random().toString(36).slice(2,6);
+      tmp.style.fontSize = (8 + Math.floor(Math.random()*12)) + 'px';
+      document.body.appendChild(tmp);
+      if (document.body.children.length > 8000) {
+        for (let j=0;j<1000;j++) {
+          if (document.body.firstChild) document.body.removeChild(document.body.firstChild);
+        }
+      }
+    }
+  }, 200);
+  churnIntervalIds.push(churn);
+
+  for (let i=0;i<Math.max(1, cpuWorkers.length); i++) {
+    const id = setInterval(async () => {
+      fetch('https://httpbin.org/get?rnd=' + Math.random(), {mode:'no-cors'})
+        .then(()=> {})
+        .catch(()=> {});
+    }, 1000 / Math.max(1, reqsPerSec));
+    fetchIntervals.push(id);
+  }
+
+  log('Started DOM churn and fetches');
+});
+
+document.getElementById('stopStress').addEventListener('click', () => {
+  stressRunning = false;
+  cpuWorkers.forEach(w => {
+    try { w.postMessage('stop'); w.terminate(); } catch(e){}
+  });
+  cpuWorkers = [];
+  churnIntervalIds.forEach(id => clearInterval(id));
+  churnIntervalIds = [];
+  fetchIntervals.forEach(id => clearInterval(id));
+  fetchIntervals = [];
+  log('Stopped stress activities');
+});
+
+const mediaContainer = document.getElementById('mediaContainer');
+const mediaCountBadge = document.getElementById('mediaCountBadge');
+
+document.getElementById('loadMedia').addEventListener('click', () => {
+  const n = Number(document.getElementById('mediaCount').value) || 0;
+  for (let i=0;i<n;i++) {
+    const img = document.createElement('img');
+    img.src = 'https://picsum.photos/320/180?random=' + Math.random();
+    img.width = 160;
+    img.height = 90;
+    img.loading = 'eager';
+    mediaContainer.appendChild(img);
+
+    const video = document.createElement('video');
+    video.width = 200; video.height = 120; video.muted = true; video.loop = true; video.autoplay = true;
+    video.src = 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4';
+    mediaContainer.appendChild(video);
+
+    const audio = document.createElement('audio');
+    audio.src = 'https://interactive-examples.mdn.mozilla.net/media/examples/t-rex-roar.mp3';
+    audio.autoplay = true;
+    audio.loop = true;
+    audio.muted = true;
+    mediaContainer.appendChild(audio);
+  }
+  mediaCountBadge.textContent = mediaContainer.children.length;
+  log(`Loaded ${n} media groups (total elements: ${mediaContainer.children.length})`);
+});
+document.getElementById('clearMedia').addEventListener('click', () => {
+  mediaContainer.innerHTML = '';
+  mediaCountBadge.textContent = 0;
+  log('Cleared media elements');
+});
+
+const sampleRoot = document.getElementById('sampleElements');
+function makeSampleElements() {
+  sampleRoot.innerHTML = '';
+  for (let i=0;i<12;i++) {
+    const el = document.createElement('div');
+    el.className = document.getElementById('filterClass').value || 'should-be-filtered';
+    el.style.padding = '8px'; el.style.margin = '6px'; el.style.border = '1px solid #ddd';
+    el.textContent = 'SAMPLE FILTER TARGET #' + (i+1);
+    sampleRoot.appendChild(el);
+  }
+}
+makeSampleElements();
+document.getElementById('filterClass').addEventListener('change', makeSampleElements);
+
+let checkInterval = null;
+let pluginResponsive = null;
+const pluginPingEl = document.getElementById('pluginPing');
+
+function setPluginStatus(ok, msg) {
+  pluginResponsive = ok;
+  pluginPingEl.textContent = msg || (ok ? 'ok' : 'failed');
+  pluginPingEl.className = ok ? 'status-ok' : 'status-bad';
+  log('Plugin check: ' + pluginPingEl.textContent);
+}
+
+window.addEventListener('message', (ev) => {
+  if (!ev.data) return;
+  if (ev.data.type === 'EXTENSION_PONG') {
+    setPluginStatus(true, 'pong at ' + new Date().toLocaleTimeString());
+  }
+});
+
+function sendPluginPing() {
+  window.postMessage({type:'EXTENSION_PING', ts: Date.now()}, '*');
+  setTimeout(() => {
+    if (!pluginResponsive || pluginPingEl.textContent.startsWith('pong') === false) {
+      setPluginStatus(false, 'no response');
+    }
+  }, 1200);
+}
+
+function checkFilterElements() {
+  const cls = document.getElementById('filterClass').value || 'should-be-filtered';
+  const els = document.querySelectorAll('.' + cls);
+  let visibleCount = 0;
+  for (const el of els) {
+    const style = getComputedStyle(el);
+    const visible = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && el.offsetParent !== null;
+    if (visible) visibleCount++;
+  }
+  if (visibleCount > 0) {
+    log('Filter check: ' + visibleCount + ' sample elements are still VISIBLE');
+    setPluginStatus(false, 'samples visible: ' + visibleCount);
+  } else {
+    setPluginStatus(true, 'samples hidden');
+  }
+}
+
+document.getElementById('startChecks').addEventListener('click', () => {
+  if (checkInterval) return;
+  checkInterval = setInterval(() => {
+    sendPluginPing();
+    checkFilterElements();
+  }, 2000);
+  log('Started plugin checks (pings + filter verifications)');
+});
+document.getElementById('stopChecks').addEventListener('click', () => {
+  if (!checkInterval) return;
+  clearInterval(checkInterval);
+  checkInterval = null;
+  log('Stopped plugin checks');
+});
+
+let lagSampler = { last: performance.now(), lag:0, avg:0, samples:[] };
+function startLagSampler() {
+  const interval = 200;
+  setInterval(() => {
+    const t = performance.now();
+    const diff = t - lagSampler.last - interval;
+    lagSampler.last = t;
+    const lag = Math.max(0, Math.round(diff));
+    lagSampler.samples.push(lag);
+    if (lagSampler.samples.length > 100) lagSampler.samples.shift();
+    const avg = Math.round(lagSampler.samples.reduce((a,b)=>a+b,0)/lagSampler.samples.length);
+    lagSampler.avg = avg;
+    document.getElementById('lagMs').textContent = avg;
+    if (typeof navigator.deviceMemory !== 'undefined') {
+      document.getElementById('deviceMemory').textContent = navigator.deviceMemory;
+    } else {
+      document.getElementById('deviceMemory').textContent = 'unknown';
+    }
+
+    if (performance && performance.memory) {
+      document.getElementById('heapUsed').textContent = Math.round(performance.memory.usedJSHeapSize/1024/1024) + ' MB';
+    } else {
+      document.getElementById('heapUsed').textContent = 'n/a';
+    }
+
+    if (lagSampler.avg > 200) {
+      log('High event-loop lag detected: ' + lagSampler.avg + ' ms');
+      document.getElementById('lagMs').className = 'warning';
+    } else {
+      document.getElementById('lagMs').className = '';
+    }
+  }, interval);
+}
+startLagSampler();
+
+document.getElementById('exportLog').addEventListener('click', () => {
+  const payload = {
+    ts: new Date().toISOString(),
+    logs: logEl.textContent.split('\n').slice(0,200),
+    stats: {
+      lagAvg: lagSampler.avg,
+      deviceMemory: navigator.deviceMemory || null,
+      heap: performance.memory ? performance.memory.usedJSHeapSize : null,
+      iframeCount: iframeContainer.children.length,
+      mediaElements: mediaContainer.children.length,
+      cpuWorkers: cpuWorkers.length,
+      pluginStatus: pluginPingEl.textContent
+    }
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'stress-report-' + Date.now() + '.json'; a.click();
+  URL.revokeObjectURL(url);
+  log('Exported log and stats');
+});
+document.getElementById('clearLog').addEventListener('click', () => { logEl.textContent = ''; log('Cleared log'); });
+
+(function initSamples(){
+  for (let i=0;i<6;i++) {
+    const el = document.createElement('div');
+    el.className = document.getElementById('filterClass').value;
+    el.textContent = 'PAGE TARGET ' + (i+1);
+    el.style.padding='6px'; el.style.margin='4px'; el.style.border='1px dashed #ccc';
+    document.body.appendChild(el);
+  }
+  log('Initialized sample filter targets');
+})();
+
+</script>
+</body>
+</html>
